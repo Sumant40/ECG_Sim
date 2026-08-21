@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "author": "Wearable ECG Belt",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-esp32-devkit-v1", "id": "esp",    "top": 80,  "left": 350, "attrs": {} },
+    { "type": "board-ssd1306",         "id": "oled1",  "top": -60, "left": 620, "attrs": { "i2cAddress": "0x3c" } },
+
+    {
+      "type": "chip-ecg-afe",
+      "id": "afe1",
+      "top": 160,
+      "left": 50,
+      "attrs": {
+        "heartRate":  "72",
+        "wanderAmp":  "50",
+        "noiseAmp":   "5",
+        "plAmp":      "50",
+        "inaGain":    "100"
+      }
+    },
+
+    {
+      "type": "wokwi-potentiometer",
+      "id": "pot_hr",
+      "top": 320,
+      "left": 50,
+      "attrs": { "label": "Heart Rate" }
+    },
+
+    {
+      "type": "wokwi-potentiometer",
+      "id": "pot_wander",
+      "top": 440,
+      "left": 50,
+      "attrs": { "label": "Wander Amp" }
+    },
+
+    { "type": "wokwi-led",        "id": "led_beat",   "top": 40,  "left": 80,  "attrs": { "color": "green", "label": "Beat" } },
+    { "type": "wokwi-resistor",   "id": "r_led",      "top": 42,  "left": 173, "rotate": 180, "attrs": { "value": "330" } },
+    { "type": "wokwi-pushbutton", "id": "btn_leadoff","top": 560, "left": 160, "attrs": { "color": "red", "label": "Lead-off", "bounce": "0" } }
+  ],
+  "connections": [
+    [ "esp:TX0",   "$serialMonitor:RX", "", [] ],
+    [ "esp:RX0",   "$serialMonitor:TX", "", [] ],
+
+    [ "esp:3V3",   "oled1:VCC",  "red",   [] ],
+    [ "esp:GND.1", "oled1:GND",  "black", [] ],
+    [ "esp:D22",   "oled1:SCL",  "green", [] ],
+    [ "esp:D21",   "oled1:SDA",  "blue",  [] ],
+
+    [ "afe1:VCC",        "esp:3V3",   "red",    [] ],
+    [ "afe1:GND",        "esp:GND.1", "black",  [] ],
+    [ "afe1:OUT",        "esp:D34",   "yellow", [] ],
+
+    [ "pot_hr:VCC",      "esp:3V3",   "red",    [] ],
+    [ "pot_hr:GND",      "esp:GND.1", "black",  [] ],
+    [ "pot_hr:SIG",      "afe1:HR_IN","orange", [] ],
+
+    [ "pot_wander:VCC",  "esp:3V3",   "red",    [] ],
+    [ "pot_wander:GND",  "esp:GND.1", "black",  [] ],
+    [ "pot_wander:SIG",  "afe1:WANDER_IN", "purple", [] ],
+
+    [ "esp:D2",    "r_led:1",          "green", [] ],
+    [ "r_led:2",   "led_beat:A",       "green", [] ],
+    [ "led_beat:C","esp:GND.1",        "black", [] ],
+
+    [ "esp:D15",       "btn_leadoff:1.l","white", [] ],
+    [ "btn_leadoff:2.l","esp:GND.1",     "black", [] ],
+    [ "btn_leadoff:1.l","afe1:LEADOFF_IN","white",[] ]
+  ],
+  "dependencies": {}
+}
