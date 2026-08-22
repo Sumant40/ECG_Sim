@@ -1,126 +1,110 @@
-// ECG Belt Simulator — software-generated PQRST waveform.
-// Generates the ECG signal directly in firmware so the OLED and Serial
-// plotter always show a proper ECG regardless of chip DAC simulation.
+/*
+ * ECG Belt — main firmware
+ *
+ * Reads filtered Lead-II ECG from the custom chip's OUT pin (GPIO34).
+ * Beat detection uses the chip's hardware BEAT output (GPIO26).
+ * Displays scrolling ECG trace + HR on SSD1306 OLED.
+ * Lead-off button (GPIO15) freezes trace and shows warning.
+ *
+ * Signal chain handled entirely in chip:
+ *   RA/LA/RL/LL/V1/V5 pots → INA → BPF 0.5-40 Hz → Notch 50 Hz → OUT
+ */
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <math.h>
 
-#define SCREEN_WIDTH    128
-#define SCREEN_HEIGHT    64
-#define OLED_ADDR      0x3C
+/* ── Pin definitions ──────────────────────────────────────────────── */
+#define ECG_ADC_PIN    34   /* chip OUT  → filtered Lead-II voltage   */
+#define BEAT_IN_PIN    26   /* chip BEAT → digital R-peak pulse       */
+#define BEAT_LED_PIN    2   /* green LED driven by chip BEAT pulse     */
+#define LEADOFF_PIN    15   /* push-button, active LOW                 */
 
-#define HR_POT_PIN      35   // potentiometer → heart-rate
-#define AMP_POT_PIN     34   // potentiometer → amplitude gain
-#define BEAT_LED_PIN     2   // green LED flashes on each beat
-#define LEADOFF_PIN     15   // push-button → lead-off (active LOW)
+/* ── Sampling ─────────────────────────────────────────────────────── */
+#define SAMPLE_RATE_HZ    500
+#define SAMPLE_PERIOD_US  2000UL
+#define WAVEFORM_SIZE     128
 
-#define SAMPLE_RATE_HZ      500
-#define SAMPLE_PERIOD_US   2000UL
-#define WAVEFORM_SIZE       128
+/* ── OLED ─────────────────────────────────────────────────────────── */
+#define SCREEN_W  128
+#define SCREEN_H   64
+#define OLED_ADDR 0x3C
 
-// ECG waveform amplitudes in mV (Lead-II)
-#define P_AMP      40.0f
-#define Q_AMP     -30.0f
-#define R_AMP     700.0f
-#define S_AMP     -80.0f
-#define T_AMP     130.0f
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
 
-#define R_THRESHOLD_MV    350.0f
-#define R_REFRACTORY_MS   260UL
+/* ── State ─────────────────────────────────────────────────────────── */
+float         waveform[WAVEFORM_SIZE];
+int           waveIdx       = 0;
+float         heartRate     = 72.0f;
 
-#define ECG_DISPLAY_MIN  -120.0f
-#define ECG_DISPLAY_MAX   800.0f
+/* Beat tracking via hardware BEAT pin */
+bool          prevBeatPin   = false;
+unsigned long lastBeatMs    = 0;
+unsigned long ledOffMs      = 0;
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+unsigned long lastSampleUs  = 0;
+unsigned long lastOledMs    = 0;
+uint8_t       serialDiv     = 0;
 
-float waveform[WAVEFORM_SIZE];
-int   waveformIndex = 0;
-
-float ecgPhase  = 0.0f;   // 0…1, fraction through cardiac cycle
-float heartRate = 72.0f;
-float ampGain   = 1.0f;   // Amplitude multiplier (0.2x to 2.0x)
-
-bool          wasAboveR      = false;
-unsigned long lastBeatMs     = 0;
-unsigned long beatLedUntilMs = 0;
-
-unsigned long lastSampleUs = 0;
-unsigned long lastOledMs   = 0;
-uint8_t       serialDiv    = 0;
-
+/* ── Helpers ──────────────────────────────────────────────────────── */
 static float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Wrapped Gaussian on a cyclic 0…1 axis.
-static float gaussian(float phase, float center, float sigma, float amp) {
-  float d = phase - center;
-  if (d >  0.5f) d -= 1.0f;
-  if (d < -0.5f) d += 1.0f;
-  return amp * expf(-(d * d) / (2.0f * sigma * sigma));
-}
-
-// Returns ECG amplitude in mV for phase in [0, 1).
-static float leadII_mV(float ph) {
-  float p =  gaussian(ph, 0.185f, 0.028f, P_AMP);
-  float q =  gaussian(ph, 0.385f, 0.009f, Q_AMP);
-  float r =  gaussian(ph, 0.407f, 0.010f, R_AMP);
-  float s =  gaussian(ph, 0.432f, 0.012f, S_AMP);
-  float t =  gaussian(ph, 0.670f, 0.070f, T_AMP);
-  return p + q + r + s + t;
-}
-
-// Read heart-rate from potentiometer (40–180 BPM).
-static float readHeartRatePot() {
+/* ── Read chip OUT and convert to centred voltage ─────────────────── */
+/* Chip outputs 0–3.3 V centred at 1.65 V (MID_RAIL).               */
+/* Returns signal in volts, range roughly ±0.3 V for Lead-II.        */
+static float readECG_V() {
+  /* 4-sample average to reduce ESP32 ADC noise */
   uint32_t sum = 0;
-  for (int i = 0; i < 4; i++) sum += analogRead(HR_POT_PIN);
-  int raw = (int)(sum >> 2);
-  if (raw < 8) return heartRate;
-  return 40.0f + ((float)raw / 4095.0f) * 140.0f;
+  for (int i = 0; i < 4; i++) sum += analogRead(ECG_ADC_PIN);
+  float adc = (float)(sum >> 2);
+  return (adc / 4095.0f * 3.3f) - 1.65f;   /* centred at 0 V */
 }
 
-// Read amplitude gain from potentiometer (0.2x to 2.0x).
-static float readAmplitudePot() {
-  uint32_t sum = 0;
-  for (int i = 0; i < 4; i++) sum += analogRead(AMP_POT_PIN);
-  int raw = (int)(sum >> 2);
-  return 0.2f + ((float)raw / 4095.0f) * 1.8f;
-}
-
-static void updateBeatDetector(float ecg_mV) {
+/* ── Handle chip BEAT pin → LED + HR update ──────────────────────── */
+static void handleBeat() {
+  bool beatNow = (digitalRead(BEAT_IN_PIN) == HIGH);
   unsigned long now = millis();
-  bool above = (ecg_mV > R_THRESHOLD_MV);
 
-  if (above && !wasAboveR && (now - lastBeatMs) > R_REFRACTORY_MS) {
+  /* Rising edge = new R-peak detected by chip hardware */
+  if (beatNow && !prevBeatPin) {
     if (lastBeatMs > 0) {
-      float bpm = 60000.0f / (float)(now - lastBeatMs);
-      if (bpm >= 35.0f && bpm <= 200.0f)
-        heartRate = heartRate * 0.85f + bpm * 0.15f;
+      float rr_ms = (float)(now - lastBeatMs);
+      if (rr_ms > 250.0f && rr_ms < 2000.0f) {
+        float bpm = 60000.0f / rr_ms;
+        heartRate = heartRate * 0.80f + bpm * 0.20f;  /* low-pass smooth */
+      }
     }
-    lastBeatMs     = now;
-    beatLedUntilMs = now + 80;
+    lastBeatMs = now;
+    ledOffMs   = now + 80;
+    digitalWrite(BEAT_LED_PIN, HIGH);
   }
-  wasAboveR = above;
-  digitalWrite(BEAT_LED_PIN, (now < beatLedUntilMs) ? HIGH : LOW);
+
+  if (now >= ledOffMs) {
+    digitalWrite(BEAT_LED_PIN, LOW);
+  }
+  prevBeatPin = beatNow;
 }
 
+/* ── OLED draw ─────────────────────────────────────────────────────── */
 static void drawOled(bool leadOff) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
   if (leadOff) {
     display.setTextSize(2);
-    display.setCursor(10, 20);
+    display.setCursor(8, 16);
     display.print("LEAD OFF");
     display.setTextSize(1);
-    display.setCursor(16, 48);
+    display.setCursor(12, 48);
     display.print("Check electrodes");
     display.display();
     return;
   }
 
+  /* ── Top bar ─ HR value ───────────────────────────────────────── */
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print("HR:");
@@ -130,37 +114,42 @@ static void drawOled(bool leadOff) {
   display.setTextSize(1);
   display.setCursor(70, 7);
   display.print("BPM");
-  display.setCursor(98, 0);
+  display.setCursor(96, 0);
   display.print("Lead II");
 
+  /* ── Divider ──────────────────────────────────────────────────── */
   display.drawLine(0, 17, 127, 17, SSD1306_WHITE);
 
-  // ECG trace area: pixels 18–63 (46 px tall).
-  // Centre baseline at y=42; scale so 700 mV R-peak → ~28 px up.
-  const float scale = 0.040f;   // px per mV
-  const int   yBase = 42;
+  /* ── ECG trace (y = 18..63, 46 px, baseline at y=42) ─────────── */
+  /*    Chip output range ≈ ±0.3 V → scale: 1 V = 120 px           */
+  const float px_per_volt = 120.0f;
+  const int   yBase       = 42;
   int prevY = -1;
   for (int x = 0; x < WAVEFORM_SIZE; x++) {
-    int idx = (waveformIndex + x) % WAVEFORM_SIZE;
-    float v = clampf(waveform[idx], ECG_DISPLAY_MIN, ECG_DISPLAY_MAX);
-    int y   = yBase - (int)(v * scale);
+    int   idx = (waveIdx + x) % WAVEFORM_SIZE;
+    float v   = clampf(waveform[idx], -0.35f, 0.35f);
+    int   y   = yBase - (int)(v * px_per_volt);
     y = constrain(y, 18, 63);
-    if (prevY >= 0) display.drawLine(x - 1, prevY, x, y, SSD1306_WHITE);
+    if (prevY >= 0) display.drawLine(x-1, prevY, x, y, SSD1306_WHITE);
     prevY = y;
   }
 
   display.display();
 }
 
+/* ── setup ─────────────────────────────────────────────────────────── */
 void setup() {
   Serial.begin(115200);
+
   pinMode(BEAT_LED_PIN, OUTPUT);
   digitalWrite(BEAT_LED_PIN, LOW);
+  pinMode(BEAT_IN_PIN, INPUT);
   pinMode(LEADOFF_PIN, INPUT_PULLUP);
   analogReadResolution(12);
 
   Wire.begin(21, 22);
   Wire.setClock(400000);
+
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println("SSD1306 init failed");
     while (true) delay(100);
@@ -170,16 +159,18 @@ void setup() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0,  0); display.print("ECG BELT SIMULATOR");
-  display.setCursor(0, 14); display.print("Lead II  PQRST");
-  display.setCursor(0, 28); display.print("Software ECG gen");
-  display.setCursor(0, 42); display.print("Initialising...");
+  display.setCursor(0, 12); display.print("6-Electrode AFE Chip");
+  display.setCursor(0, 24); display.print("RA  LA  RL  LL  V1  V5");
+  display.setCursor(0, 36); display.print("INA > BPF > Notch > OUT");
+  display.setCursor(0, 50); display.print("Initialising...");
   display.display();
-  delay(700);
+  delay(1200);
 
   for (int i = 0; i < WAVEFORM_SIZE; i++) waveform[i] = 0.0f;
   lastSampleUs = micros();
 }
 
+/* ── loop ──────────────────────────────────────────────────────────── */
 void loop() {
   unsigned long nowUs = micros();
   if (nowUs - lastSampleUs < SAMPLE_PERIOD_US) return;
@@ -187,38 +178,31 @@ void loop() {
 
   bool leadOff = (digitalRead(LEADOFF_PIN) == LOW);
 
-  // Update heart rate and amplitude gain from potentiometers.
-  heartRate = readHeartRatePot();
-  ampGain   = readAmplitudePot();
+  /* Always handle beat LED and HR update */
+  handleBeat();
 
   if (leadOff) {
-    waveform[waveformIndex] = 0.0f;
+    waveform[waveIdx] = 0.0f;
     digitalWrite(BEAT_LED_PIN, LOW);
-    wasAboveR = false;
-    ecgPhase  = 0.0f;
   } else {
-    // Advance ECG phase by one sample tick.
-    ecgPhase += heartRate / (60.0f * SAMPLE_RATE_HZ);
-    if (ecgPhase >= 1.0f) ecgPhase -= 1.0f;
+    /* Read filtered ECG from chip OUT pin */
+    float ecg_v = readECG_V();
+    waveform[waveIdx] = ecg_v;
 
-    // Generate ECG sample from Gaussian PQRST model scaled by amplitude gain.
-    float ecg_mV = leadII_mV(ecgPhase) * ampGain;
-
-    waveform[waveformIndex] = ecg_mV;
-    updateBeatDetector(ecg_mV);
-
-    // Serial plotter: output every 5th sample (~100 Hz).
-    serialDiv++;
-    if (serialDiv >= 5) {
+    /* Serial plotter: ECG (mV-scaled) | HR | lead-off sentinel */
+    if (++serialDiv >= 5) {
       serialDiv = 0;
-      Serial.print(ecg_mV, 1);
+      Serial.print(ecg_v * 1000.0f, 1);   /* convert V → mV for readability */
       Serial.print(',');
-      Serial.println(heartRate, 1);
+      Serial.print(heartRate, 1);
+      Serial.print(',');
+      Serial.println(leadOff ? 0 : 300);  /* 300 = top-of-plotter sentinel   */
     }
   }
 
-  waveformIndex = (waveformIndex + 1) % WAVEFORM_SIZE;
+  waveIdx = (waveIdx + 1) % WAVEFORM_SIZE;
 
+  /* OLED refresh at 20 Hz */
   if (millis() - lastOledMs >= 50) {
     lastOledMs = millis();
     drawOled(leadOff);

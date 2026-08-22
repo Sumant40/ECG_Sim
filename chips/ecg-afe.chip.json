@@ -1,72 +1,29 @@
 {
-  "name": "ECG Electrode + Commercial AFE",
+  "name": "ECG 6-Electrode AFE",
   "author": "Sumant Jadiyappagoudar",
   "pins": [
     "VCC",
+    "RA",
+    "LA",
+    "RL",
+    "LL",
+    "V1",
+    "V5",
     "GND",
     "HR_IN",
-    "WANDER_IN",
-    "LEADOFF_IN",
+    "LEADOFF",
     "OUT",
+    "BEAT",
     "",
     ""
   ],
   "controls": [
-    {
-      "id": "heartRate",
-      "label": "Heart Rate (BPM)",
-      "type": "range",
-      "min": 40,
-      "max": 180,
-      "step": 1
-    },
-    {
-      "id": "wanderAmp",
-      "label": "Baseline Wander (uV)",
-      "type": "range",
-      "min": 0,
-      "max": 250,
-      "step": 1
-    },
-    {
-      "id": "noiseAmp",
-      "label": "EMG Noise (uV)",
-      "type": "range",
-      "min": 0,
-      "max": 80,
-      "step": 1
-    },
-    {
-      "id": "plAmp",
-      "label": "50 Hz Residual Mains (uV)",
-      "type": "range",
-      "min": 0,
-      "max": 200,
-      "step": 1
-    },
-    {
-      "id": "inaGain",
-      "label": "AFE Gain",
-      "type": "range",
-      "min": 100,
-      "max": 900,
-      "step": 1
-    },
-    {
-      "id": "contactQuality",
-      "label": "Electrode Contact (%)",
-      "type": "range",
-      "min": 0,
-      "max": 100,
-      "step": 1
-    },
-    {
-      "id": "cmrrDb",
-      "label": "Amplifier CMRR (dB)",
-      "type": "range",
-      "min": 60,
-      "max": 120,
-      "step": 1
-    }
+    { "id": "heartRate",      "label": "Heart Rate (BPM)",          "type": "range", "min": 40,  "max": 180, "step": 1 },
+    { "id": "wanderAmp",      "label": "Baseline Wander (uV)",      "type": "range", "min": 0,   "max": 250, "step": 1 },
+    { "id": "noiseAmp",       "label": "EMG Noise (uV)",            "type": "range", "min": 0,   "max": 80,  "step": 1 },
+    { "id": "plAmp",          "label": "50 Hz Mains Residual (uV)", "type": "range", "min": 0,   "max": 200, "step": 1 },
+    { "id": "inaGain",        "label": "INA Gain",                  "type": "range", "min": 100, "max": 900, "step": 1 },
+    { "id": "contactQuality", "label": "Electrode Contact (%)",     "type": "range", "min": 0,   "max": 100, "step": 1 },
+    { "id": "cmrrDb",         "label": "Amplifier CMRR (dB)",       "type": "range", "min": 60,  "max": 120, "step": 1 }
   ]
 }
