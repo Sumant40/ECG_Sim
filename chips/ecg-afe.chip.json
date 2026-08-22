@@ -1,5 +1,5 @@
 {
-  "name": "ECG Electrode + AFE",
+  "name": "ECG Electrode + Commercial AFE",
   "author": "Sumant Jadiyappagoudar",
   "pins": [
     "VCC",
@@ -22,34 +22,50 @@
     },
     {
       "id": "wanderAmp",
-      "label": "Baseline Wander (0-200 uV)",
+      "label": "Baseline Wander (uV)",
+      "type": "range",
+      "min": 0,
+      "max": 250,
+      "step": 1
+    },
+    {
+      "id": "noiseAmp",
+      "label": "EMG Noise (uV)",
+      "type": "range",
+      "min": 0,
+      "max": 80,
+      "step": 1
+    },
+    {
+      "id": "plAmp",
+      "label": "50 Hz Residual Mains (uV)",
       "type": "range",
       "min": 0,
       "max": 200,
       "step": 1
     },
     {
-      "id": "noiseAmp",
-      "label": "EMG Noise (0-50 uV)",
+      "id": "inaGain",
+      "label": "AFE Gain",
       "type": "range",
-      "min": 0,
-      "max": 50,
+      "min": 100,
+      "max": 900,
       "step": 1
     },
     {
-      "id": "plAmp",
-      "label": "50Hz Power-line (0-100 uV)",
+      "id": "contactQuality",
+      "label": "Electrode Contact (%)",
       "type": "range",
       "min": 0,
       "max": 100,
       "step": 1
     },
     {
-      "id": "inaGain",
-      "label": "INA Gain (1-200)",
+      "id": "cmrrDb",
+      "label": "Amplifier CMRR (dB)",
       "type": "range",
-      "min": 1,
-      "max": 200,
+      "min": 60,
+      "max": 120,
       "step": 1
     }
   ]

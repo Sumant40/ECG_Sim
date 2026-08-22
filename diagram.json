@@ -13,10 +13,12 @@
       "left": 50,
       "attrs": {
         "heartRate":  "72",
-        "wanderAmp":  "50",
-        "noiseAmp":   "5",
-        "plAmp":      "50",
-        "inaGain":    "100"
+        "wanderAmp":  "35",
+        "noiseAmp":   "2",
+        "plAmp":      "15",
+        "inaGain":    "450",
+        "contactQuality": "98",
+        "cmrrDb":     "100"
       }
     },
 
@@ -25,7 +27,7 @@
       "id": "pot_hr",
       "top": 320,
       "left": 50,
-      "attrs": { "label": "Heart Rate" }
+      "attrs": {}
     },
 
     {
@@ -33,7 +35,7 @@
       "id": "pot_wander",
       "top": 440,
       "left": 50,
-      "attrs": { "label": "Wander Amp" }
+      "attrs": {}
     },
 
     { "type": "wokwi-led",        "id": "led_beat",   "top": 40,  "left": 80,  "attrs": { "color": "green", "label": "Beat" } },
@@ -56,6 +58,7 @@
     [ "pot_hr:VCC",      "esp:3V3",   "red",    [] ],
     [ "pot_hr:GND",      "esp:GND.1", "black",  [] ],
     [ "pot_hr:SIG",      "afe1:HR_IN","orange", [] ],
+    [ "pot_hr:SIG",      "esp:D35",   "orange", [] ],
 
     [ "pot_wander:VCC",  "esp:3V3",   "red",    [] ],
     [ "pot_wander:GND",  "esp:GND.1", "black",  [] ],

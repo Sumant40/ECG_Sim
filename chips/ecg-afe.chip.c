@@ -1,319 +1,253 @@
 /*
- * ECG Electrode + Analog Front-End (AFE) Custom Chip
- * ====================================================
- * Simulates the complete analog signal chain:
+ * ECG electrode + commercial analog front-end custom chip for Wokwi.
  *
- *   Dry skin electrode
- *        ↓
- *   Skin-electrode interface model (impedance, sweat, contact)
- *        ↓
- *   HPF 0.5 Hz (removes baseline wander)
- *        ↓
- *   Instrumentation Amplifier (INA gain, controllable 1–200x)
- *        ↓
- *   LPF 40 Hz (removes EMG + anti-aliases)
- *        ↓
- *   50 Hz Twin-T Notch (removes power-line interference)
- *        ↓
- *   OUT pin: 0–3.3V analog voltage → ESP32 GPIO34
+ * Pins:
+ *   HR_IN       optional 0..3.3 V control, maps to 40..180 BPM
+ *   WANDER_IN   optional 0..3.3 V control, maps to 0..250 uV baseline wander
+ *   LEADOFF_IN  HIGH = electrodes connected, LOW = lead off
+ *   OUT         analog ECG output, biased around 1.65 V
  *
- * Controls in diagram.json:
- *   heartRate   — BPM 40–180
- *   wanderAmp   — baseline wander amplitude in µV
- *   noiseAmp    — EMG noise amplitude in µV
- *   plAmp       — 50 Hz power-line amplitude in µV
- *   inaGain     — INA gain factor (real ADS1292R: up to 12x PGA)
- *
- * HR_IN and WANDER_IN pins are analog inputs:
- *   HR_IN    — if wired to a potentiometer, overrides heartRate control
- *   WANDER_IN — if wired to a potentiometer, overrides wanderAmp control
- *   LEADOFF_IN — digital: HIGH = lead off (flat output at mid-rail)
+ * The model generates a normal Lead-II style P-QRS-T waveform at the electrode,
+ * adds realistic but modest artifacts, then applies an ECG AFE chain:
+ *   electrode -> 0.5 Hz HPF -> instrumentation gain -> 40 Hz LPF -> 50 Hz notch
  */
 
 #include "wokwi-api.h"
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include <string.h>
 
-#define SAMPLE_RATE    500.0f
-#define TWO_PI         6.28318530718f
-#define VCC            3.3f
-#define MID_RAIL       1.65f    /* 0 µV maps to 1.65V = mid-rail */
+#define SAMPLE_RATE_HZ 500.0f
+#define SAMPLE_PERIOD_US 2000
+#define TWO_PI 6.28318530718f
+#define VCC 3.3f
+#define MID_RAIL 1.65f
+#define MAX_SWING_V 1.50f
 
-/* ── Biquad IIR filter (Direct Form II Transposed) ─────────────────────── */
 typedef struct {
-  float b0, b1, b2, a1, a2;
-  float w1, w2;
-} Biquad;
+  float b0;
+  float b1;
+  float b2;
+  float a1;
+  float a2;
+  float z1;
+  float z2;
+} biquad_t;
 
-static float biquad_process(Biquad *f, float x) {
-  float y = f->b0 * x + f->w1;
-  f->w1   = f->b1 * x - f->a1 * y + f->w2;
-  f->w2   = f->b2 * x - f->a2 * y;
+typedef struct {
+  pin_t out;
+  pin_t hr_in;
+  pin_t wander_in;
+  pin_t leadoff_in;
+
+  uint32_t heart_rate_attr;
+  uint32_t wander_attr;
+  uint32_t noise_attr;
+  uint32_t mains_attr;
+  uint32_t gain_attr;
+  uint32_t contact_attr;
+  uint32_t cmrr_attr;
+
+  float ecg_phase;
+  float respiration_phase;
+  float motion_phase;
+  float mains_phase;
+  uint32_t rng;
+
+  biquad_t hpf_05;
+  biquad_t lpf_40_a;
+  biquad_t lpf_40_b;
+  biquad_t notch_50;
+} chip_state_t;
+
+static float clampf(float value, float min_value, float max_value) {
+  if (value < min_value) return min_value;
+  if (value > max_value) return max_value;
+  return value;
+}
+
+static float biquad_process(biquad_t *f, float x) {
+  float y = f->b0 * x + f->z1;
+  f->z1 = f->b1 * x - f->a1 * y + f->z2;
+  f->z2 = f->b2 * x - f->a2 * y;
   return y;
 }
 
-/* ── Chip state ─────────────────────────────────────────────────────────── */
-typedef struct {
-  /* pins */
-  pin_t pin_out;
-  pin_t pin_hr_in;
-  pin_t pin_wander_in;
-  pin_t pin_leadoff;
-
-  /* controls / attributes */
-  uint32_t attr_hr;
-  uint32_t attr_wander;
-  uint32_t attr_noise;
-  uint32_t attr_pl;
-  uint32_t attr_gain;
-
-  /* ECG phase accumulator */
-  float phase;
-
-  /* noise generators */
-  uint32_t lfsr;            /* LFSR for white noise */
-  float    wander_phase;    /* 0.25 Hz respiratory wander */
-  float    pl_phase;        /* 50 Hz power-line */
-
-  /* filter stages */
-  Biquad hpf;       /* Stage 1: HPF 0.5 Hz */
-  Biquad lpf1;      /* Stage 3: LPF 40 Hz section 1 */
-  Biquad lpf2;      /* Stage 3: LPF 40 Hz section 2 */
-  Biquad notch;     /* Stage 4: 50 Hz notch */
-
-} chip_state_t;
-
-/* ── Gaussian pulse ─────────────────────────────────────────────────────── */
-static float gaussian(float p, float center, float sigma, float amp) {
-  float d = p - center;
-  return amp * expf(-(d * d) / (2.0f * sigma * sigma));
+static void biquad_set(biquad_t *f,
+                       float b0,
+                       float b1,
+                       float b2,
+                       float a1,
+                       float a2) {
+  f->b0 = b0;
+  f->b1 = b1;
+  f->b2 = b2;
+  f->a1 = a1;
+  f->a2 = a2;
+  f->z1 = 0.0f;
+  f->z2 = 0.0f;
 }
 
-/* ── PQRST waveform at electrode level (µV) ─────────────────────────────── */
-/*
- * Physiological amplitudes at the skin surface (Lead I, dry electrode):
- *   P-wave  : 15 µV  (80–100 ms wide)
- *   Q-wave  : -3 µV  (brief dip, ~20 ms)
- *   R-peak  : 10 µV  (40–60 ms wide, dominant peak)
- *   S-wave  : -4 µV  (brief, ~25 ms)
- *   ST      :  0.5 µV (isoelectric, slight elevation = normal)
- *   T-wave  :  3.5 µV (160 ms wide)
- *   U-wave  :  0.8 µV (small, post-T)
- *
- * After INA gain 100x → R-peak = 1000 µV = 1 mV at ADC input
- * After INA gain 6x  → R-peak =   60 µV         (ADS1292R default PGA)
- *
- * Sigma values are in cardiac cycle phase units (0..1).
- * At 75 BPM: 1 cycle = 800 ms.
- *   P-wave 100 ms  → sigma = 100/800 = 0.125 × (correction 0.6) ≈ 0.020
- *   QRS    80  ms  → sigma = 80/800  = 0.100 × 0.6              ≈ 0.009
- *   T-wave 160 ms  → sigma = 160/800 = 0.200 × 0.6              ≈ 0.038
- */
-static float generate_ecg_uV(float p) {
-  float P  =  gaussian(p, 0.14f, 0.020f,  15.0f);
-  float Q  = -gaussian(p, 0.42f, 0.008f,   3.0f);
-  float R  =  gaussian(p, 0.45f, 0.009f,  10.0f);
-  float S  = -gaussian(p, 0.48f, 0.009f,   4.0f);
-  float ST =  gaussian(p, 0.56f, 0.030f,   0.5f);
-  float T  =  gaussian(p, 0.67f, 0.038f,   3.5f);
-  float U  =  gaussian(p, 0.80f, 0.018f,   0.8f);
-  return P + Q + R + S + ST + T + U;
+static float wrapped_delta(float phase, float center) {
+  float d = phase - center;
+  if (d > 0.5f) d -= 1.0f;
+  if (d < -0.5f) d += 1.0f;
+  return d;
 }
 
-/* ── White noise (LFSR) ─────────────────────────────────────────────────── */
-static float white_noise(chip_state_t *s, float amp_uV) {
-  s->lfsr ^= s->lfsr << 13;
-  s->lfsr ^= s->lfsr >> 17;
-  s->lfsr ^= s->lfsr <<  5;
-  return ((float)(s->lfsr & 0xFFFF) / 32768.0f - 1.0f) * amp_uV;
+static float gaussian(float phase, float center, float sigma, float amplitude_uV) {
+  float d = wrapped_delta(phase, center);
+  return amplitude_uV * expf(-(d * d) / (2.0f * sigma * sigma));
 }
 
-/* ── Timer callback: fires at 500 Hz ────────────────────────────────────── */
-static void chip_timer_cb(void *user_data) {
+static float normal_lead_ii_uV(float phase) {
+  /*
+   * Normal sinus morphology in electrode microvolts:
+   * P wave: small rounded positive wave
+   * QRS: narrow Q dip, tall R spike, S dip
+   * T wave: broad upright recovery wave
+   */
+  float p =  gaussian(phase, 0.185f, 0.030f,  120.0f);
+  float q = -gaussian(phase, 0.382f, 0.010f,  140.0f);
+  float r =  gaussian(phase, 0.405f, 0.010f, 1100.0f);
+  float s = -gaussian(phase, 0.432f, 0.014f,  280.0f);
+  float st = gaussian(phase, 0.520f, 0.060f,   18.0f);
+  float t =  gaussian(phase, 0.675f, 0.075f,  320.0f);
+  return p + q + r + s + st + t;
+}
+
+static float random_bipolar(chip_state_t *s, float amplitude) {
+  s->rng ^= s->rng << 13;
+  s->rng ^= s->rng >> 17;
+  s->rng ^= s->rng << 5;
+  return (((float)(s->rng & 0xffffu) / 32767.5f) - 1.0f) * amplitude;
+}
+
+static float read_bpm(chip_state_t *s) {
+  float pin_v = pin_adc_read(s->hr_in);
+  if (pin_v > 0.02f) {
+    return 40.0f + clampf(pin_v / VCC, 0.0f, 1.0f) * 140.0f;
+  }
+  return clampf((float)attr_read(s->heart_rate_attr), 40.0f, 180.0f);
+}
+
+static float read_wander_uV(chip_state_t *s) {
+  float pin_v = pin_adc_read(s->wander_in);
+  if (pin_v > 0.02f) {
+    return clampf(pin_v / VCC, 0.0f, 1.0f) * 250.0f;
+  }
+  return clampf((float)attr_read(s->wander_attr), 0.0f, 250.0f);
+}
+
+static void chip_tick(void *user_data) {
   chip_state_t *s = (chip_state_t *)user_data;
 
-  /* ── Read controls ─────────────────────────────────────────────────────── */
-  /* If HR_IN pin has a potentiometer: use that (0–3.3V → 40–180 BPM) */
-  float hr_pin_v = pin_adc_read(s->pin_hr_in);
-  float bpm;
-  if (hr_pin_v > 0.01f) {
-    bpm = 40.0f + (hr_pin_v / VCC) * 140.0f;
-  } else {
-    bpm = (float)attr_read(s->attr_hr);
-  }
+  if (pin_read(s->leadoff_in) == LOW) {
+    s->motion_phase += TWO_PI * 1.1f / SAMPLE_RATE_HZ;
+    if (s->motion_phase >= TWO_PI) s->motion_phase -= TWO_PI;
 
-  float wander_pin_v = pin_adc_read(s->pin_wander_in);
-  float wander_amp;
-  if (wander_pin_v > 0.01f) {
-    wander_amp = (wander_pin_v / VCC) * 200.0f;
-  } else {
-    wander_amp = (float)attr_read(s->attr_wander);
-  }
-
-  float noise_amp = (float)attr_read(s->attr_noise);
-  float pl_amp    = (float)attr_read(s->attr_pl);
-  float gain      = (float)attr_read(s->attr_gain);
-  if (gain < 1.0f) gain = 1.0f;
-
-  /* ── Lead-off detection ────────────────────────────────────────────────── */
-  /* LEADOFF_IN pin: LOW = electrodes on, HIGH = lead off */
-  uint32_t leadoff = pin_read(s->pin_leadoff);
-
-  if (leadoff) {
-    /* Output mid-rail noise (open circuit artifact) */
-    float noise = white_noise(s, 50.0f);
-    float v = MID_RAIL + (noise * gain / 1e6f);
-    v = fmaxf(0.0f, fminf(VCC, v));
-    pin_dac_write(s->pin_out, v);
+    float artifact_v = 0.18f * sinf(s->motion_phase) + random_bipolar(s, 0.08f);
+    pin_dac_write(s->out, clampf(MID_RAIL + artifact_v, 0.0f, VCC));
     return;
   }
 
-  /* ── Phase accumulation (PQRST generator) ──────────────────────────────── */
-  float phase_inc = bpm / (60.0f * SAMPLE_RATE);
-  s->phase += phase_inc;
-  if (s->phase >= 1.0f) s->phase -= 1.0f;
+  float bpm = read_bpm(s);
+  float wander_uV = read_wander_uV(s);
+  float noise_uV = clampf((float)attr_read(s->noise_attr), 0.0f, 80.0f);
+  float mains_uV = clampf((float)attr_read(s->mains_attr), 0.0f, 200.0f);
+  float afe_gain = clampf((float)attr_read(s->gain_attr), 100.0f, 900.0f);
+  float contact = clampf((float)attr_read(s->contact_attr), 0.0f, 100.0f) / 100.0f;
+  float cmrr_db = clampf((float)attr_read(s->cmrr_attr), 60.0f, 120.0f);
 
-  /* ── Stage 0: Raw electrode signal (µV) ────────────────────────────────── */
-  float ecg_uV = generate_ecg_uV(s->phase);
+  s->ecg_phase += bpm / (60.0f * SAMPLE_RATE_HZ);
+  if (s->ecg_phase >= 1.0f) s->ecg_phase -= 1.0f;
 
-  /* ── Noise components (physically realistic) ────────────────────────────── */
-  /* 50 Hz power-line interference */
-  s->pl_phase += TWO_PI * 50.0f / SAMPLE_RATE;
-  if (s->pl_phase > TWO_PI) s->pl_phase -= TWO_PI;
-  float pl_noise = sinf(s->pl_phase) * pl_amp;
+  s->respiration_phase += TWO_PI * 0.23f / SAMPLE_RATE_HZ;
+  if (s->respiration_phase >= TWO_PI) s->respiration_phase -= TWO_PI;
 
-  /* Respiratory baseline wander at 0.25 Hz */
-  s->wander_phase += TWO_PI * 0.25f / SAMPLE_RATE;
-  if (s->wander_phase > TWO_PI) s->wander_phase -= TWO_PI;
-  float wander = sinf(s->wander_phase) * wander_amp;
+  s->motion_phase += TWO_PI * 1.3f / SAMPLE_RATE_HZ;
+  if (s->motion_phase >= TWO_PI) s->motion_phase -= TWO_PI;
 
-  /* EMG white noise */
-  float emg = white_noise(s, noise_amp);
+  s->mains_phase += TWO_PI * 50.0f / SAMPLE_RATE_HZ;
+  if (s->mains_phase >= TWO_PI) s->mains_phase -= TWO_PI;
 
-  /* Combined dirty signal at electrode */
-  float dirty_uV = ecg_uV + pl_noise + wander + emg;
+  float contact_loss = 1.0f - contact;
+  float ecg = normal_lead_ii_uV(s->ecg_phase) * (0.85f + 0.15f * contact);
+  float respiration = wander_uV * sinf(s->respiration_phase);
+  float motion = wander_uV * contact_loss * 0.7f * sinf(s->motion_phase);
+  float electrode_noise = random_bipolar(s, 2.0f + 35.0f * contact_loss);
+  float emg_noise = random_bipolar(s, noise_uV);
+  float residual_mains = mains_uV * sinf(s->mains_phase);
 
-  /* ── Stage 1: HPF 0.5 Hz — removes baseline wander ────────────────────── */
-  /*
-   * Butterworth 2nd order HPF, fc=0.5 Hz, fs=500 Hz
-   * scipy.signal.butter(2, 0.5/250, btype='high')
-   * b = [0.99875078, -1.99750156, 0.99875078]
-   * a = [1.0, -1.99750622, 0.99749690]
-   */
-  float hpf_out = biquad_process(&s->hpf, dirty_uV);
+  float common_mode_leakage = 200000.0f
+                            * powf(10.0f, -cmrr_db / 20.0f)
+                            * sinf(s->mains_phase);
 
-  /* ── Stage 2: INA gain ─────────────────────────────────────────────────── */
-  /*
-   * ADS1292R PGA: gain register bits PGA_GAIN[2:0]
-   *   000 = 6x (default)
-   *   001 = 1x
-   *   010 = 2x
-   *   011 = 3x
-   *   100 = 4x
-   *   101 = 8x
-   *   110 = 12x
-   * Set inaGain control to 6 for ADS1292R default.
-   * Set to 100 to match MIT-BIH database scale (R-peak ≈ 1000 µV on plotter).
-   */
-  float amp_uV = hpf_out * gain;
+  float electrode_uV = ecg
+                     + respiration
+                     + motion
+                     + electrode_noise
+                     + emg_noise
+                     + residual_mains
+                     + common_mode_leakage;
 
-  /* ── Stage 3: LPF 40 Hz — two cascaded biquads ─────────────────────────── */
-  /*
-   * Butterworth 4th order LPF, fc=40 Hz, fs=500 Hz
-   * scipy.signal.butter(4, 40/250, btype='low', output='sos')
-   * Section 1:
-   *   b = [0.00048845, 0.00097690, 0.00048845]
-   *   a = [1.0, -1.76004837, 0.77296192]
-   * Section 2:
-   *   b = [1.0, 2.0, 1.0]
-   *   a = [1.0, -1.90456724, 0.91487003]
-   */
-  float lpf_out = biquad_process(&s->lpf2,
-                    biquad_process(&s->lpf1, amp_uV));
+  float hpf_uV = biquad_process(&s->hpf_05, electrode_uV);
+  float amplified_uV = clampf(hpf_uV * afe_gain,
+                              -MAX_SWING_V * 1000000.0f,
+                               MAX_SWING_V * 1000000.0f);
+  float lpf_uV = biquad_process(&s->lpf_40_b,
+                  biquad_process(&s->lpf_40_a, amplified_uV));
+  float output_uV = biquad_process(&s->notch_50, lpf_uV);
 
-  /* ── Stage 4: 50 Hz notch — IIR Twin-T, Q=30 ───────────────────────────── */
-  /*
-   * scipy.signal.iirnotch(50, 30, 500)
-   * b = [0.96940026, -1.56258775, 0.96940026]
-   * a = [1.0, -1.56258775, 0.93880051]
-   */
-  float filt_uV = biquad_process(&s->notch, lpf_out);
-
-  /* ── Convert filtered µV → 0–3.3V for the analog output pin ────────────── */
-  /*
-   * Mapping:
-   *   0 µV → 1.65V (mid-rail, resting isoelectric line)
-   *   +1000 µV (R-peak at gain=100) → ~1.65 + (1000/1e6)*3.3*scale
-   *
-   * We use a scale factor so R-peak at gain=100 fills ~30% of the ADC range.
-   * Scale = 1500 (empirical for gain=100, R-peak 10µV electrode → 1000µV post-amp)
-   * → voltage swing = 1000µV / 1,000,000 * 1500 = 0.0015 * 1500 / VCC ≈ 0.68V
-   *   which maps to ADC codes ~0–4095 in a realistic range on the ESP32.
-   *
-   * For gain=6 (ADS1292R default), R-peak = 60 µV post-amp → smaller swing.
-   * User can adjust inaGain to see the effect on ADC range.
-   */
-  float scale = 1500.0f;
-  float v_out = MID_RAIL + (filt_uV / 1e6f) * scale;
-  v_out = fmaxf(0.0f, fminf(VCC, v_out));
-
-  pin_dac_write(s->pin_out, v_out);
+  float out_v = MID_RAIL + output_uV / 1000000.0f;
+  pin_dac_write(s->out, clampf(out_v, 0.0f, VCC));
 }
 
-/* ── chip_init ──────────────────────────────────────────────────────────── */
 void chip_init(void) {
   chip_state_t *s = (chip_state_t *)malloc(sizeof(chip_state_t));
   memset(s, 0, sizeof(chip_state_t));
 
-  /* Pins */
-  s->pin_out      = pin_init("OUT",        ANALOG);
-  s->pin_hr_in    = pin_init("HR_IN",      ANALOG);
-  s->pin_wander_in= pin_init("WANDER_IN",  ANALOG);
-  s->pin_leadoff  = pin_init("LEADOFF_IN", INPUT_PULLDOWN);
+  s->out = pin_init("OUT", ANALOG);
+  s->hr_in = pin_init("HR_IN", ANALOG);
+  s->wander_in = pin_init("WANDER_IN", ANALOG);
+  s->leadoff_in = pin_init("LEADOFF_IN", INPUT_PULLUP);
 
-  /* Attribute controls */
-  s->attr_hr     = attr_init("heartRate",  72);
-  s->attr_wander = attr_init("wanderAmp",  50);
-  s->attr_noise  = attr_init("noiseAmp",   5);
-  s->attr_pl     = attr_init("plAmp",      50);
-  s->attr_gain   = attr_init("inaGain",    100);
+  s->heart_rate_attr = attr_init("heartRate", 72);
+  s->wander_attr = attr_init("wanderAmp", 35);
+  s->noise_attr = attr_init("noiseAmp", 2);
+  s->mains_attr = attr_init("plAmp", 15);
+  s->gain_attr = attr_init("inaGain", 450);
+  s->contact_attr = attr_init("contactQuality", 98);
+  s->cmrr_attr = attr_init("cmrrDb", 100);
 
-  /* Initialise state */
-  s->phase        = 0.0f;
-  s->lfsr         = 0xACE1u;
-  s->wander_phase = 0.0f;
-  s->pl_phase     = 0.0f;
+  s->rng = 0x13579bdfu;
 
-  /* ── Filter coefficients ─────────────────────────────────────────────── */
-  /* Stage 1: HPF 2nd order Butterworth, fc=0.5 Hz @ 500 Hz */
-  s->hpf.b0 =  0.99875078f; s->hpf.b1 = -1.99750156f; s->hpf.b2 = 0.99875078f;
-  s->hpf.a1 = -1.99750622f; s->hpf.a2 =  0.99749690f;
-  s->hpf.w1 = s->hpf.w2 = 0.0f;
+  /* Butterworth 2nd order HPF, fc = 0.5 Hz, fs = 500 Hz. */
+  biquad_set(&s->hpf_05,
+             0.99556697f, -1.99113394f, 0.99556697f,
+            -1.99111429f,  0.99115360f);
 
-  /* Stage 3: LPF section 1 (4th order Butterworth fc=40 Hz @ 500 Hz, sos[0]) */
-  s->lpf1.b0 = 0.00048845f; s->lpf1.b1 = 0.00097690f; s->lpf1.b2 = 0.00048845f;
-  s->lpf1.a1 =-1.76004837f; s->lpf1.a2 = 0.77296192f;
-  s->lpf1.w1 = s->lpf1.w2 = 0.0f;
+  /* Butterworth 4th order LPF, fc = 40 Hz, fs = 500 Hz. */
+  biquad_set(&s->lpf_40_a,
+             0.00223489f, 0.00446978f, 0.00223489f,
+            -1.04859958f, 0.29614036f);
+  biquad_set(&s->lpf_40_b,
+             1.00000000f, 2.00000000f, 1.00000000f,
+            -1.32091343f, 0.63273879f);
 
-  /* Stage 3: LPF section 2 (sos[1]) */
-  s->lpf2.b0 = 1.00000000f; s->lpf2.b1 = 2.00000000f; s->lpf2.b2 = 1.00000000f;
-  s->lpf2.a1 =-1.90456724f; s->lpf2.a2 = 0.91487003f;
-  s->lpf2.w1 = s->lpf2.w2 = 0.0f;
+  /* IIR notch at 50 Hz, Q = 30, fs = 500 Hz. */
+  biquad_set(&s->notch_50,
+             0.98963618f, -1.60126497f, 0.98963618f,
+            -1.60126497f,  0.97927235f);
 
-  /* Stage 4: 50 Hz notch, Q=30 @ 500 Hz */
-  s->notch.b0 = 0.96940026f; s->notch.b1 =-1.56258775f; s->notch.b2 = 0.96940026f;
-  s->notch.a1 =-1.56258775f; s->notch.a2 = 0.93880051f;
-  s->notch.w1 = s->notch.w2 = 0.0f;
+  printf("ECG AFE chip ready: normal Lead-II rhythm, HPF, INA, LPF, notch\n");
 
-  printf("ECG AFE chip init — PQRST + HPF + INA + LPF + Notch ready\n");
-
-  /* 500 Hz timer — fires every 2000 µs */
-  const timer_config_t cfg = {
-    .callback  = chip_timer_cb,
+  const timer_config_t timer_cfg = {
+    .callback = chip_tick,
     .user_data = s,
   };
-  timer_t tmr = timer_init(&cfg);
-  timer_start(tmr, 2000, true);   /* 2000 µs = 500 Hz */
+  timer_t timer = timer_init(&timer_cfg);
+  timer_start(timer, SAMPLE_PERIOD_US, true);
 }
