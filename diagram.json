@@ -63,6 +63,7 @@
     [ "pot_wander:VCC",  "esp:3V3",   "red",    [] ],
     [ "pot_wander:GND",  "esp:GND.1", "black",  [] ],
     [ "pot_wander:SIG",  "afe1:WANDER_IN", "purple", [] ],
+    [ "pot_wander:SIG",  "esp:D34",   "purple", [] ],
 
     [ "esp:D2",    "r_led:1",          "green", [] ],
     [ "r_led:2",   "led_beat:A",       "green", [] ],

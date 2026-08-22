@@ -12,6 +12,7 @@
 #define OLED_ADDR      0x3C
 
 #define HR_POT_PIN      35   // potentiometer → heart-rate
+#define AMP_POT_PIN     34   // potentiometer → amplitude gain
 #define BEAT_LED_PIN     2   // green LED flashes on each beat
 #define LEADOFF_PIN     15   // push-button → lead-off (active LOW)
 
@@ -39,6 +40,7 @@ int   waveformIndex = 0;
 
 float ecgPhase  = 0.0f;   // 0…1, fraction through cardiac cycle
 float heartRate = 72.0f;
+float ampGain   = 1.0f;   // Amplitude multiplier (0.2x to 2.0x)
 
 bool          wasAboveR      = false;
 unsigned long lastBeatMs     = 0;
@@ -77,6 +79,14 @@ static float readHeartRatePot() {
   int raw = (int)(sum >> 2);
   if (raw < 8) return heartRate;
   return 40.0f + ((float)raw / 4095.0f) * 140.0f;
+}
+
+// Read amplitude gain from potentiometer (0.2x to 2.0x).
+static float readAmplitudePot() {
+  uint32_t sum = 0;
+  for (int i = 0; i < 4; i++) sum += analogRead(AMP_POT_PIN);
+  int raw = (int)(sum >> 2);
+  return 0.2f + ((float)raw / 4095.0f) * 1.8f;
 }
 
 static void updateBeatDetector(float ecg_mV) {
@@ -177,9 +187,9 @@ void loop() {
 
   bool leadOff = (digitalRead(LEADOFF_PIN) == LOW);
 
-  // Update heart rate from potentiometer.
-  float potBpm = readHeartRatePot();
-  if (lastBeatMs == 0) heartRate = potBpm;  // before first beat, trust pot
+  // Update heart rate and amplitude gain from potentiometers.
+  heartRate = readHeartRatePot();
+  ampGain   = readAmplitudePot();
 
   if (leadOff) {
     waveform[waveformIndex] = 0.0f;
@@ -191,8 +201,8 @@ void loop() {
     ecgPhase += heartRate / (60.0f * SAMPLE_RATE_HZ);
     if (ecgPhase >= 1.0f) ecgPhase -= 1.0f;
 
-    // Generate ECG sample from Gaussian PQRST model.
-    float ecg_mV = leadII_mV(ecgPhase);
+    // Generate ECG sample from Gaussian PQRST model scaled by amplitude gain.
+    float ecg_mV = leadII_mV(ecgPhase) * ampGain;
 
     waveform[waveformIndex] = ecg_mV;
     updateBeatDetector(ecg_mV);
