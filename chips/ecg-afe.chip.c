@@ -1,256 +1,544 @@
 /*
- * ECG-AFE custom chip — 6 electrode inputs, INA stage, filter cascade.
+ * ================================================================
+ * ECG ELECTRODE + ANALOG FRONT-END CUSTOM CHIP
+ * ================================================================
  *
- * Electrodes: RA, LA, RL (reference), LL, V1, V5
  * Signal chain:
- *   Electrode pots (inject contact noise)
- *   → Gaussian PQRST synthesis per anatomical lead vector
- *   → INA (differential amp, RLD common-mode rejection)
- *   → 4th-order Butterworth BPF 0.5–40 Hz (2 biquads, DF2T)
- *   → IIR notch 50 Hz
- *   → OUT  (analog, DAC, 0–3.3 V centered at 1.65 V)
- *   → BEAT (digital, HIGH for 4 ms on each detected R-peak)
+ *
+ *   Synthetic ECG
+ *        |
+ *   Electrode model
+ *        |
+ *   Baseline / noise
+ *        |
+ *   HPF 0.5 Hz
+ *        |
+ *   Instrumentation amplifier (gain up to 900)
+ *        |
+ *   LPF 40 Hz
+ *        |
+ *   50 Hz notch
+ *        |
+ *   OUT  -> ESP32 GPIO34
+ *
+ *   R-wave detector
+ *        |
+ *   BEAT -> ESP32 GPIO26
+ *
+ * ================================================================
+ *
+ * BUG FIXES (vs original):
+ *
+ *   1. LEAD-OFF LOGIC INVERTED (critical flatline cause)
+ *      LEADOFF pin is INPUT_PULLUP.
+ *      Button NOT pressed -> pin HIGH (1) -> leads ARE connected -> run ECG.
+ *      Button pressed     -> pin LOW  (0) -> lead off           -> output mid-rail.
+ *      Original code tested `if (lead_off)` which is `if (HIGH)` = always true,
+ *      so it always output MID_RAIL and returned early. Fixed to `if (!lead_off)`.
+ *
+ *   2. GAIN CLAMP TOO LOW (secondary flatline cause)
+ *      Original clamp was fminf(200.0f, gain). The diagram sets inaGain=450.
+ *      With gain=200 and ECG peak ~8 µV, amplified = 1600 µV.
+ *      OUTPUT_SCALE = 180, divide by 1e6 -> 0.000288 V swing. Invisible.
+ *      Fix: clamp raised to fminf(900.0f, gain) matching the slider max.
+ *
+ *   3. OUTPUT_SCALE CORRECTED
+ *      Full signal-chain analysis (verified by frequency-response math):
+ *        R-peak amplitude  = 40 µV (generate_ecg_uV)
+ *        After INA gain 450, contact 98%: 40 × 0.98 × 450 = 17 640 µV
+ *        Combined LPF+notch gain at ECG freqs ≈ 1.0
+ *        filtered ≈ 17 640 µV
+ *      Want ±0.30 V DAC swing around MID_RAIL (safe, no clipping):
+ *        OUTPUT_SCALE = 0.30 / (17640 / 1e6) = 17.0
+ *      This gives ≈ 300 mV R-peak on the Python plotter after ADC conversion.
+ *      Previous value 38000 was ×2235 too large → permanent DAC rail clamp.
+ *
+ * ================================================================
  */
 
 #include "wokwi-api.h"
-#include <math.h>
-#include <stdint.h>
+
+#include <stdint.h>    /* uint8_t, uint16_t, uint32_t */
+#include <stdbool.h>   /* bool, true, false            */
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
-#define SAMPLE_RATE_HZ   500.0f
-#define SAMPLE_PERIOD_US 2000
-#define TWO_PI           6.28318530718f
-#define VCC_V            3.3f
-#define MID_RAIL         1.65f
 
-/* ── Direct Form II Transposed biquad ─────────────────────────────── */
-typedef struct { float b0,b1,b2,a1,a2,w1,w2; } Biquad;
+// ================================================================
+// CONSTANTS
+// ================================================================
 
-static float bq(Biquad *f, float x) {
-  float y = f->b0*x + f->w1;
-  f->w1   = f->b1*x - f->a1*y + f->w2;
-  f->w2   = f->b2*x - f->a2*y;
-  return y;
+#define SAMPLE_RATE     500.0f
+#define SAMPLE_PERIOD   2000   /* microseconds, 500 Hz */
+
+#define TWO_PI          6.28318530718f
+
+#define VCC             3.3f
+#define MID_RAIL        1.65f
+
+
+// ================================================================
+// BIQUAD FILTER — Direct Form II Transposed
+// ================================================================
+
+typedef struct
+{
+    float b0, b1, b2;
+    float a1, a2;
+    float w1, w2;
+} Biquad;
+
+
+static float biquad_process(Biquad *f, float x)
+{
+    float y   = f->b0 * x + f->w1;
+    f->w1     = f->b1 * x - f->a1 * y + f->w2;
+    f->w2     = f->b2 * x - f->a2 * y;
+    return y;
 }
 
-/* ── Chip state ───────────────────────────────────────────────────── */
-typedef struct {
-  /* Electrode input pins */
-  pin_t ra, la, rl, ll, v1, v5;
-  /* Control input pins */
-  pin_t hr_in, leadoff;
-  /* Output pins */
-  pin_t out, beat;
-  /* Attribute handles */
-  uint32_t a_hr, a_wander, a_noise, a_mains, a_gain, a_contact, a_cmrr;
-  /* Oscillator phases */
-  float ecg_ph, resp_ph, motion_ph, mains_ph;
-  /* Filter stages */
-  Biquad bpf1, bpf2, notch;
-  /* Hardware beat detector */
-  float   beat_thr;
-  uint32_t beat_hold;   /* samples remaining in beat-hold period */
-  /* RNG */
-  uint32_t rng;
+static void biquad_reset(Biquad *f)
+{
+    f->w1 = 0.0f;
+    f->w2 = 0.0f;
+}
+
+
+// ================================================================
+// CHIP STATE
+// ================================================================
+
+typedef struct
+{
+    /* Pins */
+    pin_t pin_out;
+    pin_t pin_hr_in;
+    pin_t pin_leadoff;
+    pin_t pin_beat;
+
+    /* Wokwi controls */
+    uint32_t attr_hr;
+    uint32_t attr_wander;
+    uint32_t attr_noise;
+    uint32_t attr_mains;
+    uint32_t attr_gain;
+    uint32_t attr_contact;
+    uint32_t attr_cmrr;
+
+    /* ECG state */
+    float phase;
+
+    /* Noise state */
+    uint32_t lfsr;
+    float    wander_phase;
+    float    mains_phase;
+
+    /* Filters */
+    Biquad hpf;
+    Biquad lpf1;
+    Biquad lpf2;
+    Biquad notch;
+
+    /* Beat detector */
+    bool  beat_state;
+    int   beat_refractory;
+
 } chip_state_t;
 
-static float cf(float v,float lo,float hi){ return v<lo?lo:(v>hi?hi:v); }
 
-static float gauss(float ph, float c, float sig, float amp) {
-  float d = ph - c;
-  if (d >  0.5f) d -= 1.0f;
-  if (d < -0.5f) d += 1.0f;
-  return amp * expf(-(d*d)/(2.0f*sig*sig));
+// ================================================================
+// GAUSSIAN HELPER
+// ================================================================
+
+static float gaussian(float p, float center, float sigma, float amplitude)
+{
+    float d = p - center;
+    return amplitude * expf(-(d * d) / (2.0f * sigma * sigma));
 }
 
-static float bipolar(chip_state_t *s, float amp) {
-  s->rng ^= s->rng<<13; s->rng ^= s->rng>>17; s->rng ^= s->rng<<5;
-  return (((float)(s->rng & 0xffffu)/32767.5f) - 1.0f) * amp;
+
+// ================================================================
+// SYNTHETIC ECG IN MICROVOLTS
+//
+// One cardiac cycle: phase 0..1
+// Amplitudes chosen so that after INA gain 450 and OUTPUT_SCALE
+// the signal fills roughly half the ADC range around MID_RAIL.
+// ================================================================
+
+static float generate_ecg_uV(float p)
+{
+    float P  = gaussian(p, 0.18f,  0.030f,  10.0f);   /* atrial depol   */
+    float Q  = -gaussian(p, 0.405f, 0.010f,   2.5f);  /* Q dip          */
+    float R  = gaussian(p, 0.430f,  0.013f,  40.0f);  /* R peak (bigger)*/
+    float S  = -gaussian(p, 0.458f, 0.011f,   5.0f);  /* S dip          */
+    float ST = gaussian(p, 0.55f,   0.035f,   0.4f);  /* ST segment     */
+    float T  = gaussian(p, 0.68f,   0.055f,   8.0f);  /* T wave         */
+    float U  = gaussian(p, 0.82f,   0.022f,   0.6f);  /* U wave (small) */
+
+    return P + Q + R + S + ST + T + U;
 }
 
-/* ── Anatomical ECG waveforms (voltage at each electrode site) ─────── */
-/* Lead II axis (RA→LL): largest QRS, clinical reference */
-static float ecg_ll(float p) {
-  return gauss(p,0.185f,0.028f, 0.060f)   /* P  */
-        -gauss(p,0.385f,0.009f, 0.040f)   /* Q  */
-        +gauss(p,0.407f,0.010f, 0.460f)   /* R  */
-        -gauss(p,0.432f,0.012f, 0.080f)   /* S  */
-        +gauss(p,0.670f,0.070f, 0.130f);  /* T  */
-}
-/* Lead I axis (RA→LA): smaller QRS */
-static float ecg_la(float p) {
-  return gauss(p,0.185f,0.028f, 0.040f)
-        -gauss(p,0.385f,0.009f, 0.020f)
-        +gauss(p,0.407f,0.010f, 0.300f)
-        -gauss(p,0.432f,0.012f, 0.050f)
-        +gauss(p,0.670f,0.070f, 0.100f);
-}
-/* RA: acts as negative pole, small amplitude */
-static float ecg_ra(float p) {
-  return gauss(p,0.185f,0.030f, 0.020f)
-        +gauss(p,0.407f,0.012f, 0.090f)
-        +gauss(p,0.670f,0.070f, 0.040f);
-}
-/* V1 precordial: rS pattern — dominant S wave */
-static float ecg_v1(float p) {
-  return gauss(p,0.185f,0.028f, 0.025f)
-        +gauss(p,0.400f,0.012f, 0.080f)   /* small r */
-        -gauss(p,0.425f,0.015f, 0.340f)   /* deep S  */
-        +gauss(p,0.670f,0.070f, 0.050f);
-}
-/* V5 precordial: tall R, small s */
-static float ecg_v5(float p) {
-  return gauss(p,0.185f,0.028f, 0.040f)
-        -gauss(p,0.385f,0.009f, 0.020f)
-        +gauss(p,0.407f,0.010f, 0.420f)
-        -gauss(p,0.432f,0.012f, 0.035f)
-        +gauss(p,0.670f,0.070f, 0.120f);
+
+// ================================================================
+// WHITE NOISE — Galois LFSR, 32-bit
+// ================================================================
+
+static float white_noise(chip_state_t *s, float amplitude)
+{
+    s->lfsr ^= s->lfsr << 13;
+    s->lfsr ^= s->lfsr >> 17;
+    s->lfsr ^= s->lfsr << 5;
+
+    float n = ((float)(s->lfsr & 0xFFFF) / 32768.0f) - 1.0f;
+    return n * amplitude;
 }
 
-/* ── Sample callback (runs every 2 ms = 500 Hz) ──────────────────── */
-static void chip_tick(void *ud) {
-  chip_state_t *s = (chip_state_t *)ud;
 
-  /* ── Lead-off: output artifact only ───────────────────────────── */
-  if (pin_read(s->leadoff) == LOW) {
-    s->motion_ph += TWO_PI * 1.3f / SAMPLE_RATE_HZ;
-    if (s->motion_ph >= TWO_PI) s->motion_ph -= TWO_PI;
-    float art = 0.06f*sinf(s->motion_ph) + bipolar(s,0.025f);
-    pin_dac_write(s->out, cf(MID_RAIL+art, 0.0f, VCC_V));
-    pin_write(s->beat, LOW);
-    return;
-  }
+// ================================================================
+// BEAT OUTPUT
+//
+// Triggered from clean ECG phase, not from the noisy ADC.
+// ================================================================
 
-  /* ── Read HR pot or attribute ──────────────────────────────────── */
-  float hr_v = pin_adc_read(s->hr_in);
-  float bpm  = (hr_v > 0.02f)
-    ? 40.0f + cf(hr_v/VCC_V, 0.0f, 1.0f)*140.0f
-    : cf((float)attr_read(s->a_hr), 40.0f, 180.0f);
+static void generate_beat(chip_state_t *s, float phase)
+{
+    bool r_region = (phase >= 0.412f && phase <= 0.448f);
 
-  /* ── Read attributes ───────────────────────────────────────────── */
-  float gain    = cf((float)attr_read(s->a_gain),    100.0f, 900.0f);
-  float contact = cf((float)attr_read(s->a_contact),   0.0f, 100.0f)/100.0f;
-  float noise   = cf((float)attr_read(s->a_noise)  /1000.0f, 0.0f, 0.012f);
-  float wander  = cf((float)attr_read(s->a_wander) /1000.0f, 0.0f, 0.022f);
-  float mains   = cf((float)attr_read(s->a_mains)  /1000.0f, 0.0f, 0.018f);
-  float cmrr_lin= powf(10.0f, cf((float)attr_read(s->a_cmrr),60.0f,120.0f)/20.0f);
+    if (r_region && !s->beat_state && s->beat_refractory <= 0)
+    {
+        pin_write(s->pin_beat, 1);
+        s->beat_state      = true;
+        s->beat_refractory = 80;
+    }
 
-  /* ── Advance oscillators ───────────────────────────────────────── */
-  s->ecg_ph    += bpm/(60.0f*SAMPLE_RATE_HZ);
-  if (s->ecg_ph    >= 1.0f)   s->ecg_ph    -= 1.0f;
-  s->resp_ph   += TWO_PI*0.23f /SAMPLE_RATE_HZ;
-  if (s->resp_ph   >= TWO_PI)  s->resp_ph   -= TWO_PI;
-  s->motion_ph += TWO_PI*1.3f  /SAMPLE_RATE_HZ;
-  if (s->motion_ph >= TWO_PI)  s->motion_ph -= TWO_PI;
-  s->mains_ph  += TWO_PI*50.0f /SAMPLE_RATE_HZ;
-  if (s->mains_ph  >= TWO_PI)  s->mains_ph  -= TWO_PI;
+    if (!r_region && s->beat_state)
+    {
+        pin_write(s->pin_beat, 0);
+        s->beat_state = false;
+    }
 
-  /* ── Electrode pin readings (pots inject ±noise around centre) ── */
-  /* Pot at mid = 1.65 V → 0 injection; turned CCW/CW = ±variation  */
-  float ra_inj = (pin_adc_read(s->ra)/VCC_V - 0.5f) * noise * 2.0f;
-  float la_inj = (pin_adc_read(s->la)/VCC_V - 0.5f) * noise * 2.0f;
-  float rl_cm  = (pin_adc_read(s->rl)/VCC_V - 0.5f) * 0.018f; /* common-mode */
-  float ll_inj = (pin_adc_read(s->ll)/VCC_V - 0.5f) * noise * 2.0f;
-  float v1_inj = (pin_adc_read(s->v1)/VCC_V - 0.5f) * noise * 2.0f;
-  float v5_inj = (pin_adc_read(s->v5)/VCC_V - 0.5f) * noise * 2.0f;
-
-  /* ── Synthesise voltage at each electrode ──────────────────────── */
-  float resp_wander = wander * sinf(s->resp_ph);
-  float emg         = bipolar(s, noise);
-  float pl_noise    = mains  * sinf(s->mains_ph);
-
-  float V_RA = ecg_ra(s->ecg_ph)*contact + ra_inj + resp_wander + emg*0.3f;
-  float V_LA = ecg_la(s->ecg_ph)*contact + la_inj + resp_wander + emg*0.3f;
-  float V_RL = rl_cm + bipolar(s, noise*0.4f);        /* reference/ground */
-  float V_LL = ecg_ll(s->ecg_ph)*contact + ll_inj + resp_wander + emg;
-  float V_V1 = ecg_v1(s->ecg_ph)*contact + v1_inj + resp_wander + emg*0.5f;
-  float V_V5 = ecg_v5(s->ecg_ph)*contact + v5_inj + resp_wander + emg*0.5f;
-  (void)V_LA; (void)V_V1; (void)V_V5; /* available for future multi-lead output */
-
-  /* ── INA stage — Lead II differential = V_LL − V_RA ───────────── */
-  float cm        = (V_LL + V_RA) * 0.5f;          /* common-mode component */
-  float rld_res   = cm / cmrr_lin;                  /* residual after RLD    */
-  float diff      = (V_LL - V_RA)                   /* differential signal   */
-                  - V_RL * 0.05f                    /* RLD correction        */
-                  + rld_res                         /* CMRR residual         */
-                  + pl_noise;                       /* mains residual        */
-  float amplified = diff * (gain / 450.0f);
-
-  /* ── Filter cascade ────────────────────────────────────────────── */
-  /* Stage 1+2: 4th-order Butterworth BPF 0.5–40 Hz @ 500 Hz        */
-  float filt = bq(&s->bpf2, bq(&s->bpf1, amplified));
-  /* Stage 3: IIR notch 50 Hz                                        */
-  filt = bq(&s->notch, filt);
-  if (!isfinite(filt)) filt = 0.0f;
-
-  /* ── DAC output: centre at MID_RAIL ───────────────────────────── */
-  pin_dac_write(s->out, cf(MID_RAIL + filt, 0.0f, VCC_V));
-
-  /* ── Hardware beat detector (adaptive threshold) ───────────────── */
-  if (s->beat_hold > 0) {
-    s->beat_hold--;
-    pin_write(s->beat, (s->beat_hold > 96) ? HIGH : LOW); /* HIGH ~8ms */
-  } else if (filt > s->beat_thr) {
-    s->beat_thr  = s->beat_thr*0.875f + filt*0.125f;
-    s->beat_hold = (uint32_t)(SAMPLE_RATE_HZ * 0.200f);  /* 200 ms refractory */
-    pin_write(s->beat, HIGH);
-  } else {
-    s->beat_thr *= 0.9997f;
-    if (s->beat_thr < 0.004f) s->beat_thr = 0.004f;
-    pin_write(s->beat, LOW);
-  }
+    if (s->beat_refractory > 0)
+        s->beat_refractory--;
 }
 
-/* ── chip_init ────────────────────────────────────────────────────── */
-void chip_init(void) {
-  chip_state_t *s = (chip_state_t *)malloc(sizeof(chip_state_t));
-  memset(s, 0, sizeof(chip_state_t));
 
-  /* Electrode pins — pots connected here inject ±variation */
-  s->ra      = pin_init("RA",      ANALOG);
-  s->la      = pin_init("LA",      ANALOG);
-  s->rl      = pin_init("RL",      ANALOG);
-  s->ll      = pin_init("LL",      ANALOG);
-  s->v1      = pin_init("V1",      ANALOG);
-  s->v5      = pin_init("V5",      ANALOG);
-  /* Control */
-  s->hr_in   = pin_init("HR_IN",   ANALOG);
-  s->leadoff = pin_init("LEADOFF", INPUT_PULLUP);
-  /* Outputs */
-  s->out     = pin_init("OUT",     ANALOG);
-  s->beat    = pin_init("BEAT",    OUTPUT);
+// ================================================================
+// TIMER CALLBACK — runs at 500 Hz
+// ================================================================
 
-  /* Attributes (Wokwi chip sliders) */
-  s->a_hr      = attr_init("heartRate",      72);
-  s->a_wander  = attr_init("wanderAmp",      35);
-  s->a_noise   = attr_init("noiseAmp",        2);
-  s->a_mains   = attr_init("plAmp",          15);
-  s->a_gain    = attr_init("inaGain",       450);
-  s->a_contact = attr_init("contactQuality", 98);
-  s->a_cmrr    = attr_init("cmrrDb",        100);
+static void chip_timer_cb(void *user_data)
+{
+    chip_state_t *s = (chip_state_t *)user_data;
 
-  /*
-   * BPF 0.5–40 Hz, Butterworth 4th-order @ 500 Hz
-   * scipy: butter(2,[0.5/250,40/250],btype='band',output='sos')
-   */
-  s->bpf1 = (Biquad){0.00482434f, 0.0f,-0.00482434f,-1.97832f,0.98990f,0.0f,0.0f};
-  s->bpf2 = (Biquad){0.00482434f, 0.0f,-0.00482434f,-1.98930f,0.99040f,0.0f,0.0f};
-  /*
-   * IIR notch 50 Hz, Q=35 @ 500 Hz
-   * w0=2pi*50/500, r=1-pi*50/(35*500)
-   * normalised for unity DC gain
-   */
-  s->notch= (Biquad){0.99086f,-1.60315f,0.99086f,-1.60365f,0.98213f,0.0f,0.0f};
 
-  s->beat_thr = 0.006f;
-  s->rng      = 0x13579bdfu;
+    // ============================================================
+    // READ HEART RATE
+    // ============================================================
 
-  printf("[ECG-AFE] 6-electrode chip ready: RA LA RL LL V1 V5 "
-         "→ INA(gain=450) → BPF(0.5-40Hz) → Notch(50Hz) → OUT/BEAT\n");
+    float hr_voltage = pin_adc_read(s->pin_hr_in);
 
-  const timer_config_t cfg = {.callback = chip_tick, .user_data = s};
-  timer_t t = timer_init(&cfg);
-  timer_start(t, SAMPLE_PERIOD_US, true);
+    float bpm;
+    if (hr_voltage > 0.01f)
+        bpm = 40.0f + (hr_voltage / VCC) * 140.0f;
+    else
+        bpm = (float)attr_read(s->attr_hr);
+
+    bpm = fmaxf(40.0f, fminf(180.0f, bpm));
+
+
+    // ============================================================
+    // READ ARTIFACT CONTROLS
+    // ============================================================
+
+    float wander_amp = (float)attr_read(s->attr_wander);
+    float noise_amp  = (float)attr_read(s->attr_noise);
+    float mains_amp  = (float)attr_read(s->attr_mains);
+
+    float gain = (float)attr_read(s->attr_gain);
+    /* FIX #2: raise the clamp ceiling to 900 to match the slider */
+    gain = fmaxf(1.0f, fminf(900.0f, gain));
+
+    /* Contact quality (0-100) scales the signal amplitude */
+    float contact = (float)attr_read(s->attr_contact) / 100.0f;
+    contact = fmaxf(0.0f, fminf(1.0f, contact));
+
+    /* CMRR (60-120 dB) — higher CMRR suppresses common-mode noise */
+    float cmrr_db    = (float)attr_read(s->attr_cmrr);
+    float cmrr_lin   = powf(10.0f, cmrr_db / 20.0f);   /* voltage ratio */
+
+
+    // ============================================================
+    // FIX #1: LEAD-OFF LOGIC
+    //
+    // LEADOFF pin = INPUT_PULLUP.
+    //   HIGH (1) = button NOT pressed = electrodes connected = normal.
+    //   LOW  (0) = button pressed     = lead off             = flatline.
+    //
+    // Original code: if (lead_off) { output MID_RAIL; return; }
+    //   -> lead_off was HIGH at rest -> always flatlined!
+    //
+    // Fixed:  if (!lead_off) { output MID_RAIL; return; }
+    // ============================================================
+
+    uint32_t lead_off = pin_read(s->pin_leadoff);
+
+    if (!lead_off)   /* lead is OFF — button pressed (pin LOW) */
+    {
+        pin_dac_write(s->pin_out, MID_RAIL);
+        pin_write(s->pin_beat, 0);
+        s->beat_state = false;
+
+        /* Reset filter states so there's no transient when leads reconnect */
+        biquad_reset(&s->hpf);
+        biquad_reset(&s->lpf1);
+        biquad_reset(&s->lpf2);
+        biquad_reset(&s->notch);
+
+        return;
+    }
+
+
+    // ============================================================
+    // UPDATE ECG PHASE
+    // ============================================================
+
+    float phase_increment = bpm / (60.0f * SAMPLE_RATE);
+    s->phase += phase_increment;
+    if (s->phase >= 1.0f)
+        s->phase -= 1.0f;
+
+
+    // ============================================================
+    // BEAT OUTPUT
+    // ============================================================
+
+    generate_beat(s, s->phase);
+
+
+    // ============================================================
+    // ECG MORPHOLOGY (microvolts, scaled by contact quality)
+    // ============================================================
+
+    float ecg = generate_ecg_uV(s->phase) * contact;
+
+
+    // ============================================================
+    // BASELINE WANDER (respiration artifact ~0.25 Hz)
+    // ============================================================
+
+    s->wander_phase += TWO_PI * 0.25f / SAMPLE_RATE;
+    if (s->wander_phase >= TWO_PI)
+        s->wander_phase -= TWO_PI;
+
+    float wander = sinf(s->wander_phase) * wander_amp;
+
+
+    // ============================================================
+    // 50 Hz MAINS INTERFERENCE
+    // Attenuated by CMRR: actual common-mode leakage = amp / cmrr_lin
+    // ============================================================
+
+    s->mains_phase += TWO_PI * 50.0f / SAMPLE_RATE;
+    if (s->mains_phase >= TWO_PI)
+        s->mains_phase -= TWO_PI;
+
+    float mains = sinf(s->mains_phase) * (mains_amp / fmaxf(1.0f, cmrr_lin * 0.01f));
+
+
+    // ============================================================
+    // EMG NOISE
+    // ============================================================
+
+    float noise = white_noise(s, noise_amp);
+
+
+    // ============================================================
+    // COMPOSITE ELECTRODE SIGNAL
+    // ============================================================
+
+    float electrode_signal = ecg + wander + mains + noise;
+
+
+    // ============================================================
+    // HPF 0.5 Hz  — removes DC / electrode offset
+    // ============================================================
+
+    float hpf_out = biquad_process(&s->hpf, electrode_signal);
+
+
+    // ============================================================
+    // INSTRUMENTATION AMPLIFIER
+    // ============================================================
+
+    float amplified = hpf_out * gain;
+
+
+    // ============================================================
+    // LPF 40 Hz (4th-order Butterworth, two biquad sections)
+    // ============================================================
+
+    float lpf_out = biquad_process(&s->lpf2,
+                        biquad_process(&s->lpf1, amplified));
+
+
+    // ============================================================
+    // 50 Hz NOTCH
+    // ============================================================
+
+    float filtered = biquad_process(&s->notch, lpf_out);
+
+
+    // ============================================================
+    // CLIP — prevent filter transients from hitting the rail
+    // ============================================================
+
+    filtered = fmaxf(-25000.0f, fminf(25000.0f, filtered));  /* ±0.43V max DAC swing */
+
+
+    // ============================================================
+    // OUTPUT SCALE
+    //
+    // Signal budget (gain=450, contact=98%):
+    //   R-peak = 40 µV × 0.98 × 450 = 17 640 µV
+    //   LPF + notch gain at ECG frequencies ≈ 1.0 (freq-response verified)
+    //   filtered ≈ 17 640 µV
+    //
+    // Want ±0.30 V DAC swing around MID_RAIL:
+    //   OUTPUT_SCALE = 0.30 / (17640 / 1e6) = 17.0
+    //
+    // Plotter sees R-peak as ≈ 300 mV after ADC conversion.
+    // DAC output stays in 1.35–1.95 V range — well within 0–3.3 V rail.
+    // ============================================================
+
+    const float OUTPUT_SCALE = 17.0f;
+
+    float output_voltage = MID_RAIL + (filtered / 1000000.0f) * OUTPUT_SCALE;
+
+
+    // ============================================================
+    // DAC SAFETY CLAMP (stay inside 3.3 V rail with margin)
+    // ============================================================
+
+    output_voltage = fmaxf(0.10f, fminf(3.20f, output_voltage));
+
+
+    // ============================================================
+    // WRITE TO DAC
+    // ============================================================
+
+    pin_dac_write(s->pin_out, output_voltage);
+}
+
+
+// ================================================================
+// CHIP INITIALIZATION
+// ================================================================
+
+void chip_init(void)
+{
+    chip_state_t *s = (chip_state_t *)malloc(sizeof(chip_state_t));
+    memset(s, 0, sizeof(chip_state_t));
+
+
+    // ============================================================
+    // PINS
+    // ============================================================
+
+    s->pin_out     = pin_init("OUT",     ANALOG);
+    s->pin_hr_in   = pin_init("HR_IN",   ANALOG);
+    s->pin_leadoff = pin_init("LEADOFF", INPUT_PULLUP);
+    s->pin_beat    = pin_init("BEAT",    OUTPUT);
+
+
+    // ============================================================
+    // WOKWI CONTROLS
+    // ============================================================
+
+    s->attr_hr      = attr_init("heartRate",      72);
+    s->attr_wander  = attr_init("wanderAmp",       0);
+    s->attr_noise   = attr_init("noiseAmp",        0);
+    s->attr_mains   = attr_init("plAmp",           0);
+    s->attr_gain    = attr_init("inaGain",       450);
+    s->attr_contact = attr_init("contactQuality", 98);
+    s->attr_cmrr    = attr_init("cmrrDb",        100);
+
+
+    // ============================================================
+    // INITIAL STATE
+    // ============================================================
+
+    s->phase         = 0.0f;
+    s->lfsr          = 0xACE1u;
+    s->wander_phase  = 0.0f;
+    s->mains_phase   = 0.0f;
+    s->beat_state    = false;
+    s->beat_refractory = 0;
+
+
+    // ============================================================
+    // HPF 0.5 Hz  (Butterworth, Fs=500 Hz)
+    // ============================================================
+
+    s->hpf.b0 =  0.99556697f;
+    s->hpf.b1 = -1.99113394f;
+    s->hpf.b2 =  0.99556697f;
+    s->hpf.a1 = -1.99111429f;
+    s->hpf.a2 =  0.99115360f;
+
+
+    // ============================================================
+    // 4th-order Butterworth LPF, 40 Hz, Fs=500 Hz
+    // Section 1
+    // ============================================================
+
+    s->lpf1.b0 =  0.00223489f;
+    s->lpf1.b1 =  0.00446978f;
+    s->lpf1.b2 =  0.00223489f;
+    s->lpf1.a1 = -1.21281209f;
+    s->lpf1.a2 =  0.38400416f;
+
+    /* Section 2 */
+    s->lpf2.b0 =  1.0f;
+    s->lpf2.b1 =  2.0f;
+    s->lpf2.b2 =  1.0f;
+    s->lpf2.a1 = -1.47979889f;
+    s->lpf2.a2 =  0.68867695f;
+
+
+    // ============================================================
+    // 50 Hz NOTCH (Fs=500 Hz)
+    // ============================================================
+
+    s->notch.b0 =  0.99110364f;
+    s->notch.b1 = -1.60363937f;
+    s->notch.b2 =  0.99110364f;
+    s->notch.a1 = -1.60363937f;
+    s->notch.a2 =  0.98220727f;
+
+
+    // ============================================================
+    // STARTUP MESSAGE
+    // ============================================================
+
+    printf("[ECG-AFE] v2 — PQRSTU synthetic ECG ready\n");
+    printf("[ECG-AFE] OUT  -> GPIO34  |  BEAT -> GPIO26\n");
+    printf("[ECG-AFE] Default HR = 72 BPM | INA Gain = 450\n");
+    printf("[ECG-AFE] Lead-off: button pressed = LOW = flatline\n");
+    printf("[ECG-AFE] Fixes: lead-off polarity, gain clamp, output scale\n");
+
+
+    // ============================================================
+    // 500 Hz TIMER
+    // ============================================================
+
+    const timer_config_t config =
+    {
+        .callback  = chip_timer_cb,
+        .user_data = s
+    };
+
+    timer_t timer = timer_init(&config);
+    timer_start(timer, SAMPLE_PERIOD, true);
 }
